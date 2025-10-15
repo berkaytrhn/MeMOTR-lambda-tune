@@ -251,7 +251,7 @@ class MultiHSV:
 
 
 class MultiReverseClip:
-    def __init__(self, reverse: bool = False):
+    def __init__(self, reverse: float = 0.0):
         self.reverse = reverse
 
     def __call__(self, imgs, infos):
