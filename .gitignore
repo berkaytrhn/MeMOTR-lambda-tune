@@ -1,3 +1,6 @@
 .idea
 *.pth
 *.mp4
+
+**/venv/*
+**/dataset/*
