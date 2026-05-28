@@ -14,6 +14,10 @@ from structures.track_instances import TrackInstances
 from utils.utils import inverse_sigmoid
 from utils.box_ops import box_cxcywh_to_xyxy, box_iou_union
 
+from gating.longterm_gates import ScalarGate, VectorGate, SignalGate
+from gating.shortterm_gate import SymmetricSoftmaxGate
+from gating import signals as gating_signals
+
 
 class QueryUpdater(nn.Module):
     def __init__(self, hidden_dim: int, ffn_dim: int,
@@ -21,7 +25,12 @@ class QueryUpdater(nn.Module):
                  dropout: float,
                  use_checkpoint: bool, use_dab: bool,
                  update_threshold: float, long_memory_lambda: float,
-                 visualize: bool = False):
+                 visualize: bool = False,
+                 long_term_gate: str = "fixed",
+                 short_term_gate: str = "asym",
+                 detach_long_memory: bool = True,
+                 lambda_clip_min: float = 1.0e-3,
+                 lambda_clip_max: float = 0.5):
         super(QueryUpdater, self).__init__()
         self.hidden_dim = hidden_dim
         self.ffn_dim = ffn_dim
@@ -35,6 +44,12 @@ class QueryUpdater(nn.Module):
 
         self.update_threshold = update_threshold
         self.long_memory_lambda = long_memory_lambda
+
+        # --- Adaptive memory gating (config-gated; defaults reproduce upstream) ---
+        self.long_term_gate = long_term_gate
+        self.short_term_gate = short_term_gate
+        self.detach_long_memory = detach_long_memory
+        self._lambda_clip = (lambda_clip_min, lambda_clip_max)
 
         self.confidence_weight_net = nn.Sequential(
             MLP(input_dim=self.hidden_dim, hidden_dim=self.hidden_dim, output_dim=self.hidden_dim, num_layers=2),
@@ -63,6 +78,28 @@ class QueryUpdater(nn.Module):
             self.activation = nn.ReLU(inplace=True)
 
         self.reset_parameters()
+
+        # Build gate modules AFTER reset_parameters so their tuned inits
+        # (e.g. SignalGate's zeroed final weight) are not overwritten by the
+        # xavier_uniform_ pass below. With the default flags both stay None,
+        # so this block adds no parameters and behavior matches upstream.
+        _clip = self._lambda_clip
+        if self.long_term_gate == "scalar":
+            self.lt_gate = ScalarGate(clip=_clip)
+        elif self.long_term_gate == "vector":
+            self.lt_gate = VectorGate(dim=self.hidden_dim, clip=_clip)
+        elif self.long_term_gate == "signal":
+            self.lt_gate = SignalGate(in_dim=len(gating_signals.SIGNAL_NAMES), clip=_clip)
+        elif self.long_term_gate == "fixed":
+            self.lt_gate = None
+        else:
+            raise ValueError(f"Unknown LONG_TERM_GATE '{self.long_term_gate}'")
+        if self.short_term_gate == "symmetric":
+            self.st_gate = SymmetricSoftmaxGate(dim=self.hidden_dim, hidden=64)
+        elif self.short_term_gate == "asym":
+            self.st_gate = None
+        else:
+            raise ValueError(f"Unknown SHORT_TERM_GATE '{self.short_term_gate}'")
 
     def reset_parameters(self):
         for p in self.parameters():
@@ -103,18 +140,25 @@ class QueryUpdater(nn.Module):
             query_pos = pos_to_pos_embed(tracks[b].ref_pts.sigmoid(), num_pos_feats=self.hidden_dim//2)
             output_embed = tracks[b].output_embed
             last_output_embed = tracks[b].last_output
-            long_memory = tracks[b].long_memory.detach()
+            # Grad trap (see implementation plan fact #3): the released code
+            # detaches long_memory here, which kills the gradient to a learnable
+            # lambda. Learnable long-term gates set DETACH_LONG_MEMORY=false.
+            long_memory = tracks[b].long_memory if not self.detach_long_memory \
+                else tracks[b].long_memory.detach()
 
-            # Confidence Weight
-            confidence_weight = self.confidence_weight_net(output_embed)
-
-            # Adaptive Aggregation
-            short_memory = self.short_memory_fusion(
-                torch.cat((
-                    confidence_weight * output_embed,
-                    last_output_embed
-                ), dim=-1)
-            )
+            # Short-term fusion
+            if self.st_gate is not None:
+                short_memory = self.st_gate(output_embed, last_output_embed)
+            else:
+                # Confidence Weight
+                confidence_weight = self.confidence_weight_net(output_embed)
+                # Adaptive Aggregation
+                short_memory = self.short_memory_fusion(
+                    torch.cat((
+                        confidence_weight * output_embed,
+                        last_output_embed
+                    ), dim=-1)
+                )
 
             # Query Feature Generate
             query_pos = self.query_pos_head(query_pos)
@@ -132,8 +176,20 @@ class QueryUpdater(nn.Module):
             query_feat = self.query_feat_ffn(query_feat)
 
             # Update Long Memory
-            long_memory = (1 - self.long_memory_lambda) * long_memory + \
-                          self.long_memory_lambda * tracks[b].output_embed
+            if self.lt_gate is not None:
+                if self.long_term_gate == "signal":
+                    u_t = gating_signals.build_signals(
+                        logits=tracks[b].logits,
+                        output_embed=output_embed,
+                        long_memory=long_memory,
+                    )
+                    lam = self.lt_gate(u_t)                          # (N, 1)
+                else:
+                    lam = self.lt_gate(output_embed, long_memory)    # scalar / (D,)
+            else:
+                lam = self.long_memory_lambda
+            long_memory = (1 - lam) * long_memory + \
+                          lam * tracks[b].output_embed
             tracks[b].long_memory = tracks[b].long_memory * ~is_pos.reshape((is_pos.shape[0], 1)) + \
                                     long_memory * is_pos.reshape((is_pos.shape[0], 1))
             # Update Last Outputs Embedding
@@ -266,6 +322,11 @@ def build(config: dict):
             use_dab=config["USE_DAB"],
             update_threshold=config["UPDATE_THRESH"],
             long_memory_lambda=config["LONG_MEMORY_LAMBDA"],
-            visualize=config["VISUALIZE"]
+            visualize=config["VISUALIZE"],
+            long_term_gate=config.get("LONG_TERM_GATE", "fixed"),
+            short_term_gate=config.get("SHORT_TERM_GATE", "asym"),
+            detach_long_memory=config.get("DETACH_LONG_MEMORY", True),
+            lambda_clip_min=config.get("LAMBDA_CLIP_MIN", 1.0e-3),
+            lambda_clip_max=config.get("LAMBDA_CLIP_MAX", 0.5),
         )
 

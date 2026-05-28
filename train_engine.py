@@ -23,6 +23,7 @@ from torch.optim.lr_scheduler import MultiStepLR, CosineAnnealingLR
 from log.logger import Logger, ProgressLogger
 from log.log import MetricLog
 from models.utils import load_pretrained_model
+from gating.freeze import freeze_all_but_gates
 
 
 def train(config: dict):
@@ -38,6 +39,22 @@ def train(config: dict):
     # Load Pretrained Model
     if config["PRETRAINED_MODEL"] is not None:
         model = load_pretrained_model(model, config["PRETRAINED_MODEL"], show_details=False)
+
+    # Freeze everything but the new gating modules (config-gated; default off).
+    if config.get("FREEZE_ALL_BUT_GATES", False):
+        trainable = freeze_all_but_gates(model)
+        assert len(trainable) > 0, \
+            "FREEZE_ALL_BUT_GATES is true but no gate params (.lt_gate./.st_gate.) found to train."
+        train_logger.show(head=f"[Freeze] trainable gate params ({len(trainable)} tensors):")
+        for n in trainable:
+            train_logger.show(log=n)
+        train_logger.write(head=f"[Freeze] trainable gate params: {trainable}")
+        # Grad-trap guard (implementation plan fact #3): a learnable long-term
+        # gate gets no gradient while the long-memory read is detached.
+        if config.get("LONG_TERM_GATE", "fixed") != "fixed" and config.get("DETACH_LONG_MEMORY", True):
+            train_logger.show(head="[WARN] LONG_TERM_GATE != fixed but DETACH_LONG_MEMORY is true: "
+                                   "the long-term gate will receive ZERO gradient (grad trap). "
+                                   "Set DETACH_LONG_MEMORY=false.")
 
     # Data process
     dataset_train = build_dataset(config=config, split="train")
