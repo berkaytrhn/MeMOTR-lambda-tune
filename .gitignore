@@ -4,3 +4,8 @@
 
 **/venv/*
 **/dataset/*
+**/build/*
+
+
+__pycache__/
+MultiScaleDeformableAttention.cpython-312-x86_64-linux-gnu.so
