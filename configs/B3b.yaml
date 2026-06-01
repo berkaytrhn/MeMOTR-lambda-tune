@@ -1,0 +1,162 @@
+# B3b — per-channel learnable lambda VECTOR (long-term EMA gate).
+#
+# What it does: replaces the fixed scalar LONG_MEMORY_LAMBDA=0.01 with a learnable
+# per-channel vector lambda in R^D (D = HIDDEN_DIM = 256):
+#     lambda = clamp(sigmoid(theta), MIN, MAX),  theta in R^256, init -4.595
+# so every channel STARTS at the released 0.01 and learns its own long-term EMA
+# rate. The EMA becomes element-wise:
+#     long_memory <- (1 - lambda) * long_memory + lambda * output_embed   (broadcast over N).
+# Exactly ONE trainable tensor (lt_gate.theta, shape (256,) = 256 params);
+# everything else (backbone, decoder, the rest of query_updater) is frozen.
+# This is the vector generalization of B3a's single global scalar.
+#
+# Critical wiring (see implementation_plan.md fact #3, the "grad trap"):
+#   LONG_TERM_GATE: vector       -> QueryUpdater builds self.lt_gate = VectorGate(256)
+#   DETACH_LONG_MEMORY: False    -> removes the long_memory.detach() so theta
+#                                   actually receives gradient. With this True
+#                                   the gate trains to NOTHING (zero grad).
+#   FREEZE_ALL_BUT_GATES: True   -> only ".lt_gate." params have requires_grad.
+#   SHORT_TERM_GATE: asym        -> short-term path stays released, isolating
+#                                   the long-term contribution.
+# Run the mandatory gradient check (gating/scripts/grad_check_b3b.py) BEFORE
+# training: it asserts lt_gate.theta.grad is finite & non-zero on a smoke batch
+# and that the single trainable tensor has exactly 256 entries.
+#
+# Init via --pretrained-model (strict=False) so the new vector loads cleanly;
+# NEVER --resume (strict load crashes on the missing key).
+#
+# Seeds 42/123 and per-seed OUTPUTS_DIR are set by gating/scripts/run_b3b.py
+# (there is no --seed CLI flag, so the driver patches SEED into a per-seed copy).
+
+GIT_VERSION:
+
+MODE: train
+CONFIG_PATH:
+VISUALIZE: False
+AVAILABLE_GPUS: "0"
+DEVICE: cuda
+OUTPUTS_DIR: ./outputs/b3b/             # driver overrides to ./outputs/b3b/seed_<S>
+USE_DISTRIBUTED: False
+USE_CHECKPOINT: True                    # gradient checkpointing for headroom (single RTX 5090)
+CHECKPOINT_LEVEL: 2
+RESUME:
+RESUME_SCHEDULER: True
+MULTI_CHECKPOINT: False                 # one checkpoint_{epoch}.pth per epoch on DanceTrack
+
+# About submit
+SUBMIT_DIR:
+SUBMIT_MODEL:
+SUBMIT_DATA_SPLIT: val
+DET_SCORE_THRESH: 0.5
+TRACK_SCORE_THRESH: 0.5
+RESULT_SCORE_THRESH: 0.5
+MISS_TOLERANCE: 30
+USE_MOTION: False
+MOTION_MIN_LENGTH: 3
+MOTION_MAX_LENGTH: 5
+MOTION_LAMBDA: 0.5
+
+# About Evaluation (per-checkpoint full-val selection is run separately,
+# EVAL_MODE=continue, by gating/scripts/run_b3b.py after training)
+EVAL_DIR:
+EVAL_MODE: continue
+EVAL_MODEL:
+EVAL_PORT:
+EVAL_THREADS: 1
+EVAL_DATA_SPLIT: val
+
+# About data processing
+DATASET: DanceTrack
+USE_MOTSYNTH:
+USE_CROWDHUMAN:
+MOTSYNTH_RATE:
+DATA_ROOT: ./dataset
+DATA_PATH:
+NUM_WORKERS: 4
+BATCH_SIZE: 1
+ACCUMULATION_STEPS: 1
+COCO_SIZE: False
+OVERFLOW_BBOX: False
+REVERSE_CLIP: 0.0
+
+# About model
+BACKBONE: resnet50
+HIDDEN_DIM: 256
+FFN_DIM: 2048
+NUM_FEATURE_LEVELS: 4
+NUM_HEADS: 8
+NUM_ENC_POINTS: 4
+NUM_DEC_POINTS: 4
+NUM_ENC_LAYERS: 6
+NUM_DEC_LAYERS: 6
+MERGE_DET_TRACK_LAYER: 1
+ACTIVATION: ReLU
+RETURN_INTER_DEC: True
+EXTRA_TRACK_ATTN: False
+AUX_LOSS: True
+USE_DAB: True
+UPDATE_THRESH: 0.5
+LONG_MEMORY_LAMBDA: 0.01               # only the init reference; the vector gate replaces it
+# Adaptive memory gating — B3b settings
+LONG_TERM_GATE: vector                 # build VectorGate(D=256) at the EMA site
+SHORT_TERM_GATE: asym                  # released short-term fusion (isolate long-term effect)
+DETACH_LONG_MEMORY: False              # REQUIRED: relax the detach so theta gets gradient
+FREEZE_ALL_BUT_GATES: True             # train only ".lt_gate." -> exactly 1 trainable tensor (256,)
+LAMBDA_CLIP_MIN: 1.0e-3
+LAMBDA_CLIP_MAX: 0.5
+# Pretrain model (strict=False partial load; the new vector keeps its init)
+PRETRAINED_MODEL: ./checkpoints_pretrained/memotr_dancetrack.pth
+
+# Sampling setting
+# DEVIATION FROM RELEASED CURRICULUM (required for B3b to train; risk #2):
+# The learnable lambda only reaches the loss through a >=3-frame chain --
+# lambda updates the long-term memory at frame t, that memory builds the query
+# feature at frame t+1, which feeds the frozen decoder/loss at frame t+2. So a
+# length-2 clip gives theta ZERO gradient even with DETACH_LONG_MEMORY=False
+# (verified by gating/scripts/grad_check_b3b.py). The released curriculum
+# SAMPLE_LENGTHS=[2,3,4,5] / SAMPLE_STEPS=[6,10,14] keeps clips at length 2 for
+# all of epochs 0-5, so B3b (EPOCHS=3) would NEVER train. We therefore use a
+# CONSTANT 5-frame clip from epoch 0 (empty SAMPLE_STEPS => stage stays 0 =>
+# SAMPLE_LENGTHS[0]=5 always). 5 is the released curriculum's maximum length and
+# its SAMPLE_INTERVALS are kept; this is the minimal documented deviation needed
+# to give the gate gradient.
+SAMPLE_STEPS: []
+SAMPLE_LENGTHS: [5]
+SAMPLE_MODES: [random_interval]
+SAMPLE_INTERVALS: [10]
+
+# Training setting
+# Per the user's B3b instruction: keep the training hyperparameters at the
+# released DanceTrack-paper values (configs/train_dancetrack.yaml) as much as
+# possible, changing only the gating mechanism, the epoch budget (3) and the
+# seed count (2). So LR / LR_BACKBONE / LR_POINTS / WEIGHT_DECAY / CLIP_MAX_NORM
+# / scheduler / matcher / loss weights below all match the released config,
+# UNLIKE B3a which raised LR to 1e-3 for its single scalar.
+SEED: 42                               # driver overrides per seed (42 / 123)
+EPOCHS: 3                              # train exactly 3; validate all 3 checkpoints
+ONLY_TRAIN_QUERY_UPDATER_AFTER: 3     # >= EPOCHS so this coarse switch never fires (we freeze by requires_grad)
+DROPOUT: 0.0
+NUM_DET_QUERIES: 300
+TP_DROP_RATE: 0.0
+FP_INSERT_RATE: 0.0
+LR: 2.0e-4                             # released DanceTrack-paper LR (kept; NOT B3a's 1e-3)
+LR_BACKBONE: 2.0e-5                    # released value (backbone frozen here, kept for a complete config)
+LR_POINTS: 1.0e-5                      # released value (frozen) — kept for completeness
+WEIGHT_DECAY: 0.0005                   # released value
+CLIP_MAX_NORM: 0.1                     # released value (train_engine hard-clips to 0.1 regardless)
+LR_SCHEDULER: MultiStep
+LR_DROP_RATE: 0.1
+# Released milestone is [12] (drop at epoch 12 of 20). Kept verbatim to stay
+# faithful to the paper; with EPOCHS=3 it simply never fires, so LR is constant
+# over the run -- which also gives the cleanest sigma(theta) trajectory.
+LR_DROP_MILESTONES: [12]
+# DETR matcher
+MATCH_COST_CLASS: 2
+MATCH_COST_BBOX: 5
+MATCH_COST_GIOU: 2
+# DETR loss
+LOSS_WEIGHT_FOCAL: 2
+LOSS_WEIGHT_L1: 5
+LOSS_WEIGHT_GIOU: 2
+# Aux Loss Weight
+AUX_LOSS_WEIGHT: [1.0, 1.0, 1.0, 1.0, 1.0]

@@ -252,7 +252,15 @@ def train_one_epoch(model: MeMOTR, train_states: dict, max_norm: float,
         # Metrics log
         metric_log.update(name="total_loss", value=loss.item())
         loss = loss / accumulation_steps
-        loss.backward()
+        # When FREEZE_ALL_BUT_GATES is on, only the tiny gate param(s) train. A
+        # clip whose loss happens not to depend on a gate (e.g. no track lives
+        # long enough for the long-term lambda to reach the loss) yields a loss
+        # with no grad_fn, and loss.backward() would raise. Upstream never hits
+        # this because the backbone always requires grad. Skip backward for such
+        # clips (they contribute zero gradient anyway); inert for normal runs
+        # where the loss always requires grad.
+        if loss.requires_grad:
+            loss.backward()
 
         if (i + 1) % accumulation_steps == 0:
             if max_norm > 0:
