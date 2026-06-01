@@ -1,0 +1,163 @@
+# B3c — signal-driven learnable lambda (long-term EMA gate).
+#
+# What it does: replaces the fixed LONG_MEMORY_LAMBDA=0.01 with a per-track,
+# per-frame lambda = clamp(sigmoid(MLP(u_t)), MIN, MAX) produced by a small MLP
+# (4 -> 16 -> 1, the SignalGate) consuming a normalized signal vector u_t. The
+# MLP's final bias is init -4.595 and its final weight is zeroed, so training
+# STARTS at the released 0.01 for every track regardless of signal, and learns a
+# function of the signals. Only ".lt_gate." params train (~97 params over 4
+# tensors); everything else (backbone, decoder, the rest of query_updater) is
+# frozen.
+#
+# Signals u_t (gating/signals.py), per active track per frame:
+#   c_t : matched-detection confidence (max class prob)   -- WIRED (real)
+#   s_t : cosine sim between f_t (output_embed) and M_{t-1} -- WIRED (real)
+#   delta_t : IoU(box decoded from M_{t-1}, det)            -- NOT WIRED -> 0
+#   H_t : decoder cross-attention entropy                   -- NOT WIRED -> 0
+# delta_t and H_t need model plumbing the released code does not expose and are
+# intentionally left as zero placeholders (the extractor raises if asked to fake
+# them). Per IMPLEMENTATION_PLAN B3c, report signal distributions to the human
+# (gating/scripts/report_signals_b3c.py) before relying on results; wiring the
+# remaining two signals needs human go-ahead.
+#
+# Critical wiring (see IMPLEMENTATION_PLAN fact #3, the "grad trap"):
+#   LONG_TERM_GATE: signal       -> QueryUpdater builds self.lt_gate = SignalGate
+#   DETACH_LONG_MEMORY: False    -> removes the long_memory.detach() so the gate
+#                                   actually receives gradient. With this True
+#                                   the gate trains to NOTHING (zero grad).
+#   FREEZE_ALL_BUT_GATES: True   -> only ".lt_gate." params have requires_grad.
+#   SHORT_TERM_GATE: asym        -> short-term path stays released, isolating
+#                                   the long-term contribution.
+# Run the mandatory gradient check (gating/scripts/grad_check_b3c.py) BEFORE
+# training: it asserts the gate receives a non-zero gradient on a smoke batch.
+#
+# Init via --pretrained-model (strict=False) so the new gate loads cleanly;
+# NEVER --resume (strict load crashes on the missing keys).
+#
+# Seeds 42/123 and per-seed OUTPUTS_DIR are set by gating/scripts/run_b3c.py
+# (there is no --seed CLI flag, so the driver patches SEED into a per-seed copy).
+
+GIT_VERSION:
+
+MODE: train
+CONFIG_PATH:
+VISUALIZE: False
+AVAILABLE_GPUS: "0"
+DEVICE: cuda
+OUTPUTS_DIR: ./outputs/b3c/             # driver overrides to ./outputs/b3c/seed_<S>
+USE_DISTRIBUTED: False
+USE_CHECKPOINT: True                    # gradient checkpointing for headroom (single RTX 5090)
+CHECKPOINT_LEVEL: 2
+RESUME:
+RESUME_SCHEDULER: True
+MULTI_CHECKPOINT: False                 # one checkpoint_{epoch}.pth per epoch on DanceTrack
+
+# About submit
+SUBMIT_DIR:
+SUBMIT_MODEL:
+SUBMIT_DATA_SPLIT: val
+DET_SCORE_THRESH: 0.5
+TRACK_SCORE_THRESH: 0.5
+RESULT_SCORE_THRESH: 0.5
+MISS_TOLERANCE: 30
+USE_MOTION: False
+MOTION_MIN_LENGTH: 3
+MOTION_MAX_LENGTH: 5
+MOTION_LAMBDA: 0.5
+
+# About Evaluation (per-checkpoint full-val selection is run separately,
+# EVAL_MODE=continue, by gating/scripts/run_b3c.py after training)
+EVAL_DIR:
+EVAL_MODE: continue
+EVAL_MODEL:
+EVAL_PORT:
+EVAL_THREADS: 1
+EVAL_DATA_SPLIT: val
+
+# About data processing
+DATASET: DanceTrack
+USE_MOTSYNTH:
+USE_CROWDHUMAN:
+MOTSYNTH_RATE:
+DATA_ROOT: ./dataset
+DATA_PATH:
+NUM_WORKERS: 4
+BATCH_SIZE: 1
+ACCUMULATION_STEPS: 1
+COCO_SIZE: False
+OVERFLOW_BBOX: False
+REVERSE_CLIP: 0.0
+
+# About model
+BACKBONE: resnet50
+HIDDEN_DIM: 256
+FFN_DIM: 2048
+NUM_FEATURE_LEVELS: 4
+NUM_HEADS: 8
+NUM_ENC_POINTS: 4
+NUM_DEC_POINTS: 4
+NUM_ENC_LAYERS: 6
+NUM_DEC_LAYERS: 6
+MERGE_DET_TRACK_LAYER: 1
+ACTIVATION: ReLU
+RETURN_INTER_DEC: True
+EXTRA_TRACK_ATTN: False
+AUX_LOSS: True
+USE_DAB: True
+UPDATE_THRESH: 0.5
+LONG_MEMORY_LAMBDA: 0.01               # only the init reference; the signal gate replaces it
+# Adaptive memory gating — B3c settings
+LONG_TERM_GATE: signal                 # build SignalGate (MLP 4->16->1) at the EMA site
+SHORT_TERM_GATE: asym                  # released short-term fusion (isolate long-term effect)
+DETACH_LONG_MEMORY: False              # REQUIRED: relax the detach so the gate gets gradient
+FREEZE_ALL_BUT_GATES: True             # train only ".lt_gate." -> ~97 params over 4 tensors
+LAMBDA_CLIP_MIN: 1.0e-3
+LAMBDA_CLIP_MAX: 0.5
+# Pretrain model (strict=False partial load; new gate keeps its init)
+PRETRAINED_MODEL: ./checkpoints_pretrained/memotr_dancetrack.pth
+
+# Sampling setting
+# DEVIATION FROM RELEASED CURRICULUM (required for B3c to train; risk #2):
+# The learnable lambda only reaches the loss through a >=3-frame chain --
+# lambda updates the long-term memory at frame t, that memory builds the query
+# feature at frame t+1, which feeds the frozen decoder/loss at frame t+2. So a
+# length-2 clip gives the gate ZERO gradient even with DETACH_LONG_MEMORY=False
+# (verified by gating/scripts/grad_check_b3c.py). The released curriculum
+# SAMPLE_LENGTHS=[2,3,4,5] / SAMPLE_STEPS=[6,10,14] keeps clips at length 2 for
+# all of epochs 0-9, so B3c (EPOCHS=10) would never train. We therefore use a
+# CONSTANT 5-frame clip from epoch 0 (empty SAMPLE_STEPS => stage stays 0 =>
+# SAMPLE_LENGTHS[0]=5 always). This matches the B3a/B3b deviation; 5 is the
+# released curriculum's maximum length, so it is in-distribution.
+SAMPLE_STEPS: []
+SAMPLE_LENGTHS: [5]
+SAMPLE_MODES: [random_interval]
+SAMPLE_INTERVALS: [10]
+
+# Training setting
+SEED: 42                               # driver overrides per seed (42 / 123)
+EPOCHS: 10                             # train exactly 10; validate all 10 checkpoints
+ONLY_TRAIN_QUERY_UPDATER_AFTER: 10    # >= EPOCHS so this coarse switch never fires (we freeze by requires_grad)
+DROPOUT: 0.0
+NUM_DET_QUERIES: 300
+TP_DROP_RATE: 0.0
+FP_INSERT_RATE: 0.0
+LR: 2.0e-4                             # SAME as the original DanceTrack training config (per the human's constraint)
+LR_BACKBONE: 2.0e-5                    # unused (backbone frozen) but kept for a complete config
+LR_POINTS: 1.0e-5                      # unused (frozen) — kept for completeness
+WEIGHT_DECAY: 0.0005
+CLIP_MAX_NORM: 0.1                     # note: train_engine hard-clips to 0.1 regardless of this value
+LR_SCHEDULER: MultiStep
+LR_DROP_RATE: 0.1
+# Scheduler decision (risk #4): constant LR over the 10 short epochs (empty
+# milestones => MultiStepLR never drops) for a clean training curve.
+LR_DROP_MILESTONES: []
+# DETR matcher
+MATCH_COST_CLASS: 2
+MATCH_COST_BBOX: 5
+MATCH_COST_GIOU: 2
+# DETR loss
+LOSS_WEIGHT_FOCAL: 2
+LOSS_WEIGHT_L1: 5
+LOSS_WEIGHT_GIOU: 2
+# Aux Loss Weight
+AUX_LOSS_WEIGHT: [1.0, 1.0, 1.0, 1.0, 1.0]
