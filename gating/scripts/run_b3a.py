@@ -33,7 +33,7 @@ import sys
 import yaml
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-DEFAULT_SEEDS = [42, 123, 2024]
+DEFAULT_SEEDS = [42] #, 123, 2024]
 
 
 def write_seed_config(base_config: str, seed: int, seed_dir: str) -> str:
