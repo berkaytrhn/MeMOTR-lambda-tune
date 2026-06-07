@@ -132,8 +132,8 @@ SAMPLE_INTERVALS: [10]
 # seed count (2). So LR / LR_BACKBONE / LR_POINTS / WEIGHT_DECAY / CLIP_MAX_NORM
 # / scheduler / matcher / loss weights below all match the released config,
 # UNLIKE B3a which raised LR to 1e-3 for its single scalar.
-SEED: 42                               # driver overrides per seed (42 / 123)
-EPOCHS: 3                              # train exactly 3; validate all 3 checkpoints
+SEED: 123                               # driver overrides per seed (42 / 123)
+EPOCHS: 5                              # train exactly 3; validate all 3 checkpoints
 ONLY_TRAIN_QUERY_UPDATER_AFTER: 3     # >= EPOCHS so this coarse switch never fires (we freeze by requires_grad)
 DROPOUT: 0.0
 NUM_DET_QUERIES: 300
