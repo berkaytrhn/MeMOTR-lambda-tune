@@ -10,7 +10,7 @@ For each seed it:
      submit() rebuilds the (symmetric-gate) model from <seed_dir>/train/config.yaml,
      so no extra wiring is needed; TrackEval writes pedestrian_summary.txt per ckpt.
 
-B2 trains for 10 epochs over 2 seeds (42, 123) per the user's instruction, keeping
+B2 trains for 10 epochs over a single seed (123) per the user's instruction, keeping
 the ORIGINAL released DanceTrack training hyperparameters (LR 2e-4, MultiStep
 scheduler, LR-drop, weight decay, grad-clip) — only EPOCHS (10) and the seed count
 change vs. the paper, plus the symmetric short-term gate.
@@ -25,8 +25,8 @@ Idempotent: a seed whose final checkpoint already exists skips training (unless
 --force); eval/continue itself skips checkpoints already summarized.
 
 Usage (from repo root):
-    python gating/scripts/run_b2.py                       # seeds 42 123
-    python gating/scripts/run_b2.py --seeds 42
+    python gating/scripts/run_b2.py                       # seed 123
+    python gating/scripts/run_b2.py --seeds 123
     python gating/scripts/run_b2.py --skip-grad-check
     python gating/scripts/run_b2.py --dry-run
 """
@@ -38,7 +38,7 @@ import sys
 import yaml
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-DEFAULT_SEEDS = [42, 123]
+DEFAULT_SEEDS = [123]
 
 
 def write_seed_config(base_config: str, seed: int, seed_dir: str):
