@@ -4,3 +4,8 @@
 
 **/venv/*
 **/dataset/*
+
+__pycache__/
+models/ops/
+
+/outputs/**
