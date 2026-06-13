@@ -24,7 +24,8 @@ import argparse
 import sys
 from pathlib import Path
 from typing import List, Tuple
-
+import os
+import glob
 
 # Sequences per split for the official DanceTrack release.
 EXPECTED_COUNTS = {"train": 40, "val": 25, "test": 35}
@@ -184,6 +185,6 @@ def main() -> int:
     print("OK" if not all_warnings else "OK with warnings")
     return 1 if (args.strict and all_warnings) else 0
 
-
 if __name__ == "__main__":
     sys.exit(main())
+    

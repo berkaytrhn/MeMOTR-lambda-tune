@@ -9,3 +9,9 @@ __pycache__/
 models/ops/
 
 /outputs/**
+**/build/*
+
+**/outputs/*
+
+__pycache__/
+MultiScaleDeformableAttention.cpython-312-x86_64-linux-gnu.so
