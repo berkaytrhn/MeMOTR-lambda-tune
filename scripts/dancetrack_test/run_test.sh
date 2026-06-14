@@ -55,6 +55,10 @@ if [[ ! -f "${SUBMIT_DIR}/train/config.yaml" ]]; then
 fi
 if [[ ! -f "${SUBMIT_DIR}/${SUBMIT_MODEL}" ]]; then
   echo "ERROR: checkpoint not found: ${SUBMIT_DIR}/${SUBMIT_MODEL}" >&2
+  echo "       Set SUBMIT_MODEL to one of the checkpoints in ${SUBMIT_DIR}:" >&2
+  ( cd "${SUBMIT_DIR}" && ls -1 *.pth 2>/dev/null | sed 's/^/         - /' >&2 ) \
+    || echo "         (no .pth files found there)" >&2
+  echo "       e.g.  SUBMIT_MODEL=checkpoint_4.pth $0" >&2
   exit 1
 fi
 
